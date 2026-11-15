@@ -1,0 +1,4 @@
+#pragma once
+#include <cmath>
+// Same expression as Qt 6: degrees * (M_PI / 180)
+inline double qDegreesToRadians(double degrees) { return degrees * (3.14159265358979323846 / 180); }

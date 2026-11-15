@@ -1,0 +1,12 @@
+#pragma once
+#include <string>
+class QString : public std::string
+{
+public:
+    using std::string::string;
+    QString() = default;
+    QString(const std::string &s) : std::string(s) {}
+    bool isEmpty() const { return empty(); }
+    QString &operator+=(const QString &o) { append(o); return *this; }
+};
+#define QStringLiteral(x) QString(x)

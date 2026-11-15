@@ -1,0 +1,12 @@
+#pragma once
+// Minimal stand-in for QObject, just enough to compile the legacy 6.14 model classes
+// without Qt to record baseline values. Signals become no-ops.
+#define Q_OBJECT
+#define signals public
+#define emit
+class QObject
+{
+public:
+    explicit QObject(QObject * = nullptr) {}
+    virtual ~QObject() = default;
+};

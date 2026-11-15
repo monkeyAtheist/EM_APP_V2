@@ -1,0 +1,16 @@
+# House style: Allman braces, 4 spaces, 120 columns. Run on every change:
+#   clang-format -i physics/src/*.cpp physics/include/qsig/*.h tests/*.cpp tests/*.h
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 120
+BreakBeforeBraces: Allman
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortBlocksOnASingleLine: Empty
+NamespaceIndentation: None
+PointerAlignment: Right
+SortIncludes: Never
+IncludeBlocks: Preserve
+FixNamespaceComments: true

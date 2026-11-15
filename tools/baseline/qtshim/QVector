@@ -1,0 +1,12 @@
+#pragma once
+#include <vector>
+template <class T>
+class QVector : public std::vector<T>
+{
+public:
+    using std::vector<T>::vector;
+    int size() const { return static_cast<int>(std::vector<T>::size()); }
+    bool isEmpty() const { return std::vector<T>::empty(); }
+    const T &at(int i) const { return (*this)[static_cast<std::size_t>(i)]; }
+    void removeAt(int i) { this->erase(this->begin() + i); }
+};
