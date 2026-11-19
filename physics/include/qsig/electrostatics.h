@@ -26,7 +26,17 @@ struct FieldResult
     bool potentialDefined = true;
     bool singular = false;
     std::string note;
+
+    // Potential that stays usable when a source extends to infinity (equipotentials, differences of
+    // potential). Equal to 'potential' for finite sources. An infinite line or cylinder contributes
+    // -lambda/(2 pi eps0) ln(rho / rho0) with V = 0 at rho0 = kInfiniteReferenceRadius from its axis;
+    // an infinite plane contributes -sigma |d| / (2 eps0), with V = 0 on the plane.
+    double relativePotential = 0.0;
+    bool relativePotentialDefined = true;
+    bool potentialReferenced = false; // an infinite source fixed the reference of relativePotential
 };
+
+inline constexpr double kInfiniteReferenceRadius = 1.0; // m
 
 struct Source
 {
@@ -66,6 +76,9 @@ struct Source
     double thickness = 0.1;    // finite-thickness rectangular slab [m]
     double angleDeg = 0.0;     // rotation of line / plate in the XY plane
 };
+
+// Line, cylinders and plane: their charge extends to infinity, so V cannot be referenced to infinity.
+bool extendsToInfinity(Source::Type type);
 
 FieldResult fieldFromSource(const Source &source, const Vec3 &point);
 FieldResult fieldAt(const std::vector<Source> &sources, const Vec3 &point);

@@ -146,6 +146,17 @@ void Solver2D::clearMaterials()
     rebuildCoefficients();
 }
 
+void Solver2D::setMaterials(const std::vector<Material> &materials)
+{
+    if (materials.size() != m_materials.size()) return;
+    for (std::size_t k = 0; k < materials.size(); ++k)
+    {
+        m_materials[k] = sanitizedMaterial(materials[k]);
+        if (m_materials[k].pec) m_ex[k] = m_ey[k] = m_ez[k] = 0.0;
+    }
+    rebuildCoefficients();
+}
+
 void Solver2D::setMaterialCell(int x, int y, const Material &material)
 {
     if (!inside(x, y)) return;
@@ -229,6 +240,18 @@ void Solver2D::clearSources()
     ensurePrimarySource();
 }
 
+void Solver2D::setSources(const std::vector<Source> &sources)
+{
+    m_sources.clear();
+    for (const auto &source : sources) m_sources.push_back(sanitizedSource(source));
+    if (m_sources.empty())
+    {
+        Source silent;
+        silent.enabled = false;
+        m_sources.push_back(sanitizedSource(silent));
+    }
+}
+
 void Solver2D::setGuideModeSource(const GuideModeSource &sourceValue)
 {
     GuideModeSource source = sourceValue;
@@ -307,12 +330,55 @@ void Solver2D::rebuildCoefficientAt(int x, int y)
     const double loss = m.conductivitySPerM * m_dtS / (2.0 * eps);
     m_ceze[k] = m.pec ? 0.0 : (1.0 - loss) / (1.0 + loss);
     m_cezh[k] = m.pec ? 0.0 : (m_dtS / eps) / (1.0 + loss);
+    m_pec[k] = m.pec ? 1 : 0;
+    // The magnetic coefficients of this cell and of its lower and left neighbours use this material.
+    rebuildMagneticCoefficientAt(x, y);
+    rebuildMagneticCoefficientAt(x, y - 1);
+    rebuildMagneticCoefficientAt(x - 1, y);
+}
+
+// Same expressions as the update loops used to evaluate at every step.
+void Solver2D::rebuildMagneticCoefficientAt(int x, int y)
+{
+    if (!inside(x, y)) return;
+    const auto k = static_cast<std::size_t>(index(x, y));
+    if (y + 1 < m_ny)
+    {
+        const auto ku = static_cast<std::size_t>(index(x, y + 1));
+        m_dtOverMuY[k] = m_dtS / (mu0 * std::max(1.0e-6, 0.5 * (m_materials[k].muR + m_materials[ku].muR)));
+    }
+    if (x + 1 < m_nx)
+    {
+        const auto kr = static_cast<std::size_t>(index(x + 1, y));
+        m_dtOverMuX[k] = m_dtS / (mu0 * std::max(1.0e-6, 0.5 * (m_materials[k].muR + m_materials[kr].muR)));
+    }
+    m_dtOverMu[k] = m_dtS / (mu0 * std::max(1.0e-6, m_materials[k].muR));
 }
 
 void Solver2D::rebuildCoefficients()
 {
+    const std::size_t n = m_materials.size();
+    m_ceze.assign(n, 1.0);
+    m_cezh.assign(n, 0.0);
+    m_dtOverMuY.assign(n, 0.0);
+    m_dtOverMuX.assign(n, 0.0);
+    m_dtOverMu.assign(n, 0.0);
+    m_pec.assign(n, 0);
     for (int y = 0; y < m_ny; ++y)
         for (int x = 0; x < m_nx; ++x) rebuildCoefficientAt(x, y);
+}
+
+void Solver2D::rebuildCpmlActivity()
+{
+    auto active = [](const std::vector<double> &kappa, const std::vector<double> &c) {
+        std::vector<unsigned char> flags(kappa.size(), 0);
+        for (std::size_t i = 0; i < kappa.size(); ++i) flags[i] = (kappa[i] != 1.0 || c[i] != 0.0) ? 1 : 0;
+        return flags;
+    };
+    m_cpmlRowE = active(m_kappaYE, m_cYE);
+    m_cpmlRowH = active(m_kappaYH, m_cYH);
+    m_cpmlColE = active(m_kappaXE, m_cXE);
+    m_cpmlColH = active(m_kappaXH, m_cXH);
 }
 
 void Solver2D::rebuildCpmlProfiles()
@@ -336,39 +402,41 @@ void Solver2D::rebuildCpmlProfiles()
         const double alphaMaxE = 0.05 * sigmaMaxE;
         const double magneticScale = mu0 / epsilon0;
 
-        for (int i = 0; i < n; ++i)
+        // Depth into the layer of a position along the axis, in cells: 0 at the interface, 1 at the
+        // outer edge. E samples sit on the nodes (i), H samples half a cell further (i + 1/2) on the
+        // Yee grid, so each gets the profile of its own position (a shared profile leaves the layer
+        // mismatched by half a cell and reflects a few percent).
+        const auto depthAt = [&](double position)
         {
             double depth = 0.0;
-            if (i < npml)
-                depth = double(npml - i) / double(npml);
-            else if (i >= n - npml)
-                depth = double(i - (n - npml - 1)) / double(npml);
-            if (!(depth > 0.0)) continue;
-
-            depth = std::clamp(depth, 0.0, 1.0);
+            if (position < npml)
+                depth = (npml - position) / double(npml);
+            else if (position > n - npml - 1)
+                depth = (position - (n - npml - 1)) / double(npml);
+            return std::clamp(depth, 0.0, 1.0);
+        };
+        const auto compute = [&](double depth, double base, double scale, double &kappa, double &b, double &c)
+        {
+            if (!(depth > 0.0)) return;
             const double graded = std::pow(depth, m_cpmlPolynomialOrder);
-            const double kappa = 1.0 + (m_cpmlKappaMax - 1.0) * graded;
-            const double sigmaE = sigmaMaxE * graded;
-            const double alphaE = alphaMaxE * (1.0 - depth);
-            const double sigmaH = sigmaE * magneticScale;
-            const double alphaH = alphaE * magneticScale;
-
-            const auto compute = [&](double sigma, double alpha, double base, double &b, double &c)
-            {
-                b = std::exp(-((sigma / kappa) + alpha) * m_dtS / base);
-                const double denominator = sigma * kappa + kappa * kappa * alpha;
-                c = std::abs(denominator) > tiny ? sigma * (b - 1.0) / denominator : 0.0;
-            };
-
-            kappaE[static_cast<std::size_t>(i)] = kappa;
-            kappaH[static_cast<std::size_t>(i)] = kappa;
-            compute(sigmaE, alphaE, epsilon0, bE[static_cast<std::size_t>(i)], cE[static_cast<std::size_t>(i)]);
-            compute(sigmaH, alphaH, mu0, bH[static_cast<std::size_t>(i)], cH[static_cast<std::size_t>(i)]);
+            kappa = 1.0 + (m_cpmlKappaMax - 1.0) * graded;
+            const double sigma = sigmaMaxE * graded * scale;
+            const double alpha = alphaMaxE * (1.0 - depth) * scale;
+            b = std::exp(-((sigma / kappa) + alpha) * m_dtS / base);
+            const double denominator = sigma * kappa + kappa * kappa * alpha;
+            c = std::abs(denominator) > tiny ? sigma * (b - 1.0) / denominator : 0.0;
+        };
+        for (int i = 0; i < n; ++i)
+        {
+            const auto k = static_cast<std::size_t>(i);
+            compute(depthAt(i), epsilon0, 1.0, kappaE[k], bE[k], cE[k]);
+            compute(depthAt(i + 0.5), mu0, magneticScale, kappaH[k], bH[k], cH[k]);
         }
     };
 
     buildAxis(m_nx, m_dxM, m_kappaXE, m_bXE, m_cXE, m_kappaXH, m_bXH, m_cXH);
     buildAxis(m_ny, m_dyM, m_kappaYE, m_bYE, m_cYE, m_kappaYH, m_bYH, m_cYH);
+    rebuildCpmlActivity();
 }
 
 void Solver2D::clearCpmlMemory()
@@ -472,52 +540,61 @@ void Solver2D::step(int count)
     }
 }
 
+// Update loops. The coefficients are precomputed (rebuildCoefficients) and the CPML convolution is
+// only evaluated in the absorbing layers: elsewhere kappa = 1 and psi stays 0, so the result is the
+// same as evaluating it everywhere.
 void Solver2D::stepTMz()
 {
+    const bool cpml = m_boundary == BoundaryCondition::Cpml;
     // Hx = Hx - dt/mu * dEz/dy
     for (int y = 0; y < m_ny - 1; ++y)
+    {
+        const auto row = static_cast<std::size_t>(y);
+        const bool stretched = cpml && m_cpmlRowH[row];
         for (int x = 0; x < m_nx; ++x)
         {
             const auto k = static_cast<std::size_t>(index(x, y));
             const auto ku = static_cast<std::size_t>(index(x, y + 1));
-            const double mu = mu0 * std::max(1.0e-6, 0.5 * (m_materials[k].muR + m_materials[ku].muR));
             const double derivative = (m_ez[ku] - m_ez[k]) / m_dyM;
             double effective = derivative;
-            if (m_boundary == BoundaryCondition::Cpml)
+            if (stretched)
             {
-                m_psiHxY[k] =
-                    m_bYH[static_cast<std::size_t>(y)] * m_psiHxY[k] + m_cYH[static_cast<std::size_t>(y)] * derivative;
-                effective = derivative / m_kappaYH[static_cast<std::size_t>(y)] + m_psiHxY[k];
+                m_psiHxY[k] = m_bYH[row] * m_psiHxY[k] + m_cYH[row] * derivative;
+                effective = derivative / m_kappaYH[row] + m_psiHxY[k];
             }
-            m_hx[k] -= (m_dtS / mu) * effective;
+            m_hx[k] -= m_dtOverMuY[k] * effective;
         }
+    }
 
     // Hy = Hy + dt/mu * dEz/dx
     for (int y = 0; y < m_ny; ++y)
         for (int x = 0; x < m_nx - 1; ++x)
         {
+            const auto col = static_cast<std::size_t>(x);
             const auto k = static_cast<std::size_t>(index(x, y));
             const auto kr = static_cast<std::size_t>(index(x + 1, y));
-            const double mu = mu0 * std::max(1.0e-6, 0.5 * (m_materials[k].muR + m_materials[kr].muR));
             const double derivative = (m_ez[kr] - m_ez[k]) / m_dxM;
             double effective = derivative;
-            if (m_boundary == BoundaryCondition::Cpml)
+            if (cpml && m_cpmlColH[col])
             {
-                m_psiHyX[k] =
-                    m_bXH[static_cast<std::size_t>(x)] * m_psiHyX[k] + m_cXH[static_cast<std::size_t>(x)] * derivative;
-                effective = derivative / m_kappaXH[static_cast<std::size_t>(x)] + m_psiHyX[k];
+                m_psiHyX[k] = m_bXH[col] * m_psiHyX[k] + m_cXH[col] * derivative;
+                effective = derivative / m_kappaXH[col] + m_psiHyX[k];
             }
-            m_hy[k] += (m_dtS / mu) * effective;
+            m_hy[k] += m_dtOverMuX[k] * effective;
         }
 
     // Only the Mur boundary needs the previous time level; avoid a full-grid copy otherwise.
     std::vector<double> oldScalar;
     if (m_boundary == BoundaryCondition::MurFirstOrder) oldScalar = m_ez;
     for (int y = 1; y < m_ny - 1; ++y)
+    {
+        const auto row = static_cast<std::size_t>(y);
+        const bool stretchedY = cpml && m_cpmlRowE[row];
         for (int x = 1; x < m_nx - 1; ++x)
         {
+            const auto col = static_cast<std::size_t>(x);
             const auto k = static_cast<std::size_t>(index(x, y));
-            if (m_materials[k].pec)
+            if (m_pec[k])
             {
                 m_ez[k] = 0.0;
                 continue;
@@ -527,17 +604,19 @@ void Solver2D::stepTMz()
             const double dHydx = (m_hy[k] - m_hy[kl]) / m_dxM;
             const double dHxdy = (m_hx[k] - m_hx[kd]) / m_dyM;
             double effX = dHydx, effY = dHxdy;
-            if (m_boundary == BoundaryCondition::Cpml)
+            if (cpml && m_cpmlColE[col])
             {
-                m_psiEzX[k] =
-                    m_bXE[static_cast<std::size_t>(x)] * m_psiEzX[k] + m_cXE[static_cast<std::size_t>(x)] * dHydx;
-                m_psiEzY[k] =
-                    m_bYE[static_cast<std::size_t>(y)] * m_psiEzY[k] + m_cYE[static_cast<std::size_t>(y)] * dHxdy;
-                effX = dHydx / m_kappaXE[static_cast<std::size_t>(x)] + m_psiEzX[k];
-                effY = dHxdy / m_kappaYE[static_cast<std::size_t>(y)] + m_psiEzY[k];
+                m_psiEzX[k] = m_bXE[col] * m_psiEzX[k] + m_cXE[col] * dHydx;
+                effX = dHydx / m_kappaXE[col] + m_psiEzX[k];
+            }
+            if (stretchedY)
+            {
+                m_psiEzY[k] = m_bYE[row] * m_psiEzY[k] + m_cYE[row] * dHxdy;
+                effY = dHxdy / m_kappaYE[row] + m_psiEzY[k];
             }
             m_ez[k] = m_ceze[k] * m_ez[k] + m_cezh[k] * (effX - effY);
         }
+    }
 
     if (m_boundary == BoundaryCondition::MurFirstOrder)
         applyMurBoundary(m_ez, oldScalar);
@@ -549,13 +628,17 @@ void Solver2D::stepTMz()
 
 void Solver2D::stepTEz()
 {
+    const bool cpml = m_boundary == BoundaryCondition::Cpml;
     // Ex = Ex + dt/eps * dHz/dy
     // Ey = Ey - dt/eps * dHz/dx
     for (int y = 1; y < m_ny; ++y)
+    {
+        const auto row = static_cast<std::size_t>(y);
+        const bool stretched = cpml && m_cpmlRowE[row];
         for (int x = 0; x < m_nx; ++x)
         {
             const auto k = static_cast<std::size_t>(index(x, y));
-            if (m_materials[k].pec)
+            if (m_pec[k])
             {
                 m_ex[k] = 0.0;
                 continue;
@@ -563,20 +646,21 @@ void Solver2D::stepTEz()
             const auto kd = static_cast<std::size_t>(index(x, y - 1));
             const double derivative = (m_hz[k] - m_hz[kd]) / m_dyM;
             double effective = derivative;
-            if (m_boundary == BoundaryCondition::Cpml)
+            if (stretched)
             {
-                m_psiExY[k] =
-                    m_bYE[static_cast<std::size_t>(y)] * m_psiExY[k] + m_cYE[static_cast<std::size_t>(y)] * derivative;
-                effective = derivative / m_kappaYE[static_cast<std::size_t>(y)] + m_psiExY[k];
+                m_psiExY[k] = m_bYE[row] * m_psiExY[k] + m_cYE[row] * derivative;
+                effective = derivative / m_kappaYE[row] + m_psiExY[k];
             }
             m_ex[k] = m_ceze[k] * m_ex[k] + m_cezh[k] * effective;
         }
+    }
 
     for (int y = 0; y < m_ny; ++y)
         for (int x = 1; x < m_nx; ++x)
         {
+            const auto col = static_cast<std::size_t>(x);
             const auto k = static_cast<std::size_t>(index(x, y));
-            if (m_materials[k].pec)
+            if (m_pec[k])
             {
                 m_ey[k] = 0.0;
                 continue;
@@ -584,11 +668,10 @@ void Solver2D::stepTEz()
             const auto kl = static_cast<std::size_t>(index(x - 1, y));
             const double derivative = (m_hz[k] - m_hz[kl]) / m_dxM;
             double effective = derivative;
-            if (m_boundary == BoundaryCondition::Cpml)
+            if (cpml && m_cpmlColE[col])
             {
-                m_psiEyX[k] =
-                    m_bXE[static_cast<std::size_t>(x)] * m_psiEyX[k] + m_cXE[static_cast<std::size_t>(x)] * derivative;
-                effective = derivative / m_kappaXE[static_cast<std::size_t>(x)] + m_psiEyX[k];
+                m_psiEyX[k] = m_bXE[col] * m_psiEyX[k] + m_cXE[col] * derivative;
+                effective = derivative / m_kappaXE[col] + m_psiEyX[k];
             }
             m_ey[k] = m_ceze[k] * m_ey[k] - m_cezh[k] * effective;
         }
@@ -597,26 +680,31 @@ void Solver2D::stepTEz()
     std::vector<double> oldScalar;
     if (m_boundary == BoundaryCondition::MurFirstOrder) oldScalar = m_hz;
     for (int y = 0; y < m_ny - 1; ++y)
+    {
+        const auto row = static_cast<std::size_t>(y);
+        const bool stretchedY = cpml && m_cpmlRowH[row];
         for (int x = 0; x < m_nx - 1; ++x)
         {
+            const auto col = static_cast<std::size_t>(x);
             const auto k = static_cast<std::size_t>(index(x, y));
             const auto ku = static_cast<std::size_t>(index(x, y + 1));
             const auto kr = static_cast<std::size_t>(index(x + 1, y));
-            const double mu = mu0 * std::max(1.0e-6, m_materials[k].muR);
             const double dExdy = (m_ex[ku] - m_ex[k]) / m_dyM;
             const double dEydx = (m_ey[kr] - m_ey[k]) / m_dxM;
             double effY = dExdy, effX = dEydx;
-            if (m_boundary == BoundaryCondition::Cpml)
+            if (stretchedY)
             {
-                m_psiHzY[k] =
-                    m_bYH[static_cast<std::size_t>(y)] * m_psiHzY[k] + m_cYH[static_cast<std::size_t>(y)] * dExdy;
-                m_psiHzX[k] =
-                    m_bXH[static_cast<std::size_t>(x)] * m_psiHzX[k] + m_cXH[static_cast<std::size_t>(x)] * dEydx;
-                effY = dExdy / m_kappaYH[static_cast<std::size_t>(y)] + m_psiHzY[k];
-                effX = dEydx / m_kappaXH[static_cast<std::size_t>(x)] + m_psiHzX[k];
+                m_psiHzY[k] = m_bYH[row] * m_psiHzY[k] + m_cYH[row] * dExdy;
+                effY = dExdy / m_kappaYH[row] + m_psiHzY[k];
             }
-            m_hz[k] += (m_dtS / mu) * (effY - effX);
+            if (cpml && m_cpmlColH[col])
+            {
+                m_psiHzX[k] = m_bXH[col] * m_psiHzX[k] + m_cXH[col] * dEydx;
+                effX = dEydx / m_kappaXH[col] + m_psiHzX[k];
+            }
+            m_hz[k] += m_dtOverMu[k] * (effY - effX);
         }
+    }
 
     if (m_boundary == BoundaryCondition::MurFirstOrder)
         applyMurBoundary(m_hz, oldScalar);

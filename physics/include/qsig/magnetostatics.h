@@ -67,9 +67,17 @@ struct Source
 
 FieldResult fieldFromSource(const Source &source, const Vec3 &point);
 FieldResult fieldAt(const std::vector<Source> &sources, const Vec3 &point);
+// Line integral of H along the straight segment from a to b [A]: the magnetic potential difference
+// between the two points along that path (Ampere: around a closed path it is the enclosed current, so
+// between two points it depends on the path once currents are encircled). Composite Gauss-Legendre
+// rule; NaN when a sample of the path falls on a conductor, where the field is singular.
+double magnetomotiveForce(const std::vector<Source> &sources, const Vec3 &a, const Vec3 &b, int panels = 64);
 Vec3 lorentzForceAt(const std::vector<Source> &sources, const Vec3 &point, double testChargeC,
                     const Vec3 &velocityMetersPerSecond);
 Vec3 axisUnit(const Source &source);
+// Orthonormal (u, v) spanning the plane normal to 'axis', with u x v = axis: the frame in which loops
+// are laid out (a positive current turns from u to v). Shared with the drawing code.
+void perpendicularBasis(const Vec3 &axis, Vec3 &u, Vec3 &v);
 
 std::string typeName(Source::Type type);
 std::string strengthSymbol(Source::Type type);

@@ -145,7 +145,9 @@ inline void setupFdtd(FDTD::Solver2D &solver, const FdtdCase &c)
 inline std::vector<NumericalEM::WireNetworkMomInput> wireCases()
 {
     std::vector<NumericalEM::WireNetworkMomInput> cases;
+    // The 6.14 baseline was recorded with the historical pulse formulation (its default then).
     NumericalEM::WireNetworkMomInput dipole;
+    dipole.currentBasisTreatment = NumericalEM::WireCurrentBasisTreatment::PulsePointMatching;
     dipole.frequencyHz = 100e6;
     dipole.wires.push_back({"D", {0.0, 0.0, -0.7}, {0.0, 0.0, 0.7}, 0.001});
     dipole.feeds.push_back({"F", {0.0, 0.0, 0.0}, {1.0, 0.0}, 50.0});
@@ -158,6 +160,7 @@ inline std::vector<NumericalEM::WireNetworkMomInput> wireCases()
     cases.push_back(yagi);
 
     NumericalEM::WireNetworkMomInput vee;
+    vee.currentBasisTreatment = NumericalEM::WireCurrentBasisTreatment::PulsePointMatching;
     vee.frequencyHz = 145e6;
     vee.wires.push_back({"A", {0.0, 0.0, 0.0}, {0.42, 0.0, 0.25}, 0.0015});
     vee.wires.push_back({"B", {0.0, 0.0, 0.0}, {-0.42, 0.0, 0.25}, 0.0015});

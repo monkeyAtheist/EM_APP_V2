@@ -108,6 +108,13 @@ template <class T> bool solveInPlace(DenseMatrix<T> &a, std::vector<T> &b, std::
     return true;
 }
 
+// The same elimination for large complex systems (the wire + surface solver: a thousand unknowns and
+// more): by blocks of columns, so that the rows being updated stay in the cache, with the arithmetic
+// written on the real and imaginary parts, and the rows of the trailing matrix shared between
+// threads. The rows are updated independently: the result does not depend on the number of threads.
+bool solveComplexBlocked(DenseMatrix<std::complex<double>> &a, std::vector<std::complex<double>> &b,
+                         std::vector<std::complex<double>> &x, PivotStats &stats);
+
 // Convenience overload for the legacy row-of-vectors representation (copies once).
 template <class T>
 bool solve(const std::vector<std::vector<T>> &a, std::vector<T> b, std::vector<T> &x, PivotStats &stats)

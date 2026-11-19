@@ -1,7 +1,10 @@
 #include "qsig/numerical_em_solvers.h"
+#include "qsig/fast_math.h"
 #include "qsig/linalg.h"
+#include "wire_pair_integrals.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -403,12 +406,6 @@ RooftopBasisSet buildRooftopBasis(const std::vector<NetworkNode> &nodes,
     return out;
 }
 
-inline double rooftopShape(bool peakAtP0, double xi)
-{
-    const double u = 0.5 * (xi + 1.0);
-    return peakAtP0 ? (1.0 - u) : u;
-}
-
 double pointSegmentDistance3(const Vec3 &p, const Vec3 &a, const Vec3 &b, double *tOut = nullptr)
 {
     const Vec3 ab = b - a;
@@ -419,52 +416,10 @@ double pointSegmentDistance3(const Vec3 &p, const Vec3 &a, const Vec3 &b, double
     return norm(p - (a + ab * t));
 }
 
-double segmentSegmentDistance3(const Vec3 &p0, const Vec3 &p1, const Vec3 &q0, const Vec3 &q1, double *sOut = nullptr,
-                               double *tOut = nullptr, Vec3 *midOut = nullptr)
-{
-    // Closest points on two finite 3D segments (Ericson-style clamped solution).  This is
-    // used only for CAD/topology contact detection; electromagnetic coupling still uses the
-    // full EFIE kernel even when conductors are not galvanically connected.
-    const Vec3 d1 = p1 - p0, d2 = q1 - q0, r = p0 - q0;
-    const double a = dot(d1, d1), e = dot(d2, d2), f = dot(d2, r);
-    double s = 0.0, t = 0.0;
-    if (a <= 1e-30 && e <= 1e-30)
-    {
-        if (sOut) *sOut = 0.0;
-        if (tOut) *tOut = 0.0;
-        if (midOut) *midOut = (p0 + q0) * 0.5;
-        return norm(p0 - q0);
-    }
-    if (a <= 1e-30)
-        t = std::clamp(f / e, 0.0, 1.0);
-    else
-    {
-        const double c = dot(d1, r);
-        if (e <= 1e-30)
-            s = std::clamp(-c / a, 0.0, 1.0);
-        else
-        {
-            const double b = dot(d1, d2), den = a * e - b * b;
-            if (std::abs(den) > 1e-30) s = std::clamp((b * f - c * e) / den, 0.0, 1.0);
-            t = (b * s + f) / e;
-            if (t < 0.0)
-            {
-                t = 0.0;
-                s = std::clamp(-c / a, 0.0, 1.0);
-            }
-            else if (t > 1.0)
-            {
-                t = 1.0;
-                s = std::clamp((b - c) / a, 0.0, 1.0);
-            }
-        }
-    }
-    const Vec3 cp = p0 + d1 * s, cq = q0 + d2 * t;
-    if (sOut) *sOut = s;
-    if (tOut) *tOut = t;
-    if (midOut) *midOut = (cp + cq) * 0.5;
-    return norm(cp - cq);
-}
+using qsig::detail::integrateRooftopPairMixedPotential;
+using qsig::detail::RooftopPairVariants;
+using qsig::detail::rooftopVariant;
+using qsig::detail::segmentSegmentDistance3;
 
 std::complex<double> projectedEfieKernel(const Vec3 &rObs, const Vec3 &tObs, const Vec3 &rSrc, const Vec3 &tSrc,
                                          double regularizationRadiusM, double k, double omega)
@@ -517,69 +472,6 @@ std::complex<double> integrateProjectedPulseSegment(const Vec3 &rObs, const Vec3
                 sum += GlW[static_cast<std::size_t>(g)] * projectedEfieKernel(rObs, tObs, rs, tSrc, a, k, omega);
             }
         total += 0.5 * norm(a1 - a0) * sum;
-    }
-    return total;
-}
-
-// Radius-aware composite Galerkin integration for a pair of piecewise-linear rooftop supports.
-// Unlike the historical 4x4 rule, this resolves BOTH the observation and source spans on the
-// wire-radius scale when their centerlines are self/near coupled.  The rooftop shape is always
-// evaluated in the original span coordinate, so panel subdivision changes quadrature only --
-// it does not alter the basis or the EFIE operator.
-std::complex<double> integrateProjectedRooftopPair(const Vec3 &obsP0, const Vec3 &obsP1, const Vec3 &obsTangent,
-                                                   bool obsPeakAtP0, const Vec3 &srcP0, const Vec3 &srcP1,
-                                                   const Vec3 &srcTangent, bool srcPeakAtP0, double radiusM, double k,
-                                                   double omega)
-{
-    constexpr std::array<double, 4> gx{-0.8611363115940526, -0.3399810435848563, 0.3399810435848563,
-                                       0.8611363115940526};
-    constexpr std::array<double, 4> gw{0.3478548451374538, 0.6521451548625461, 0.6521451548625461, 0.3478548451374538};
-
-    const double lo = norm(obsP1 - obsP0), ls = norm(srcP1 - srcP0);
-    if (!(lo > 1e-18) || !(ls > 1e-18)) return {0.0, 0.0};
-    const double a = std::max(radiusM, 1e-12);
-    const double d = segmentSegmentDistance3(obsP0, obsP1, srcP0, srcP1);
-
-    int po = 1, ps = 1;
-    const bool nearPair = d < std::max(5.0 * a, 0.60 * std::max(lo, ls));
-    if (nearPair)
-    {
-        // The near-field rooftop double integral needs several Gauss panels even when Δl/a is only
-        // 3..8. Use approximately one composite panel per radius plus two guard panels. The cap
-        // keeps very thin-wire educational loops practical even when their Δl/a is much larger.
-        po = std::clamp(static_cast<int>(std::ceil(lo / a)) + 2, 4, 48);
-        ps = std::clamp(static_cast<int>(std::ceil(ls / a)) + 2, 4, 48);
-    }
-
-    const Vec3 od = obsP1 - obsP0, sd = srcP1 - srcP0;
-    std::complex<double> total{0.0, 0.0};
-    for (int io = 0; io < po; ++io)
-    {
-        const double uo0 = double(io) / double(po), uo1 = double(io + 1) / double(po);
-        const double uoc = 0.5 * (uo0 + uo1), uoh = 0.5 * (uo1 - uo0);
-        for (int is = 0; is < ps; ++is)
-        {
-            const double us0 = double(is) / double(ps), us1 = double(is + 1) / double(ps);
-            const double usc = 0.5 * (us0 + us1), ush = 0.5 * (us1 - us0);
-            std::complex<double> pair{0.0, 0.0};
-            for (int go = 0; go < 4; ++go)
-            {
-                const double uo = uoc + uoh * gx[static_cast<std::size_t>(go)];
-                const double xo = 2.0 * uo - 1.0;
-                const Vec3 ro = obsP0 + od * uo;
-                const double fo = rooftopShape(obsPeakAtP0, xo);
-                for (int gs = 0; gs < 4; ++gs)
-                {
-                    const double us = usc + ush * gx[static_cast<std::size_t>(gs)];
-                    const double xs = 2.0 * us - 1.0;
-                    const Vec3 rs = srcP0 + sd * us;
-                    const double fs = rooftopShape(srcPeakAtP0, xs);
-                    pair += gw[static_cast<std::size_t>(go)] * gw[static_cast<std::size_t>(gs)] * fo * fs *
-                            projectedEfieKernel(ro, obsTangent, rs, srcTangent, a, k, omega);
-                }
-            }
-            total += (lo * uoh) * (ls * ush) * pair;
-        }
     }
     return total;
 }
@@ -1449,6 +1341,39 @@ WireNetworkMomResult solveWireNetworkMom(const WireNetworkMomInput &input)
             static_cast<std::size_t>(nr), std::vector<std::complex<double>>(static_cast<std::size_t>(nr), {0.0, 0.0}));
         std::vector<std::complex<double>> rhsSolve(static_cast<std::size_t>(nr), {0.0, 0.0});
 
+        // Every (observation span, source span) pair takes part in up to four matrix entries (two
+        // functions per span on each side): its integrals are computed once, all shape combinations
+        // together, a row of spans at a time, and the row is dropped after the last test function
+        // on that span.
+        const std::size_t edgeCount = orientedEdges.size();
+        std::vector<int> lastUse(edgeCount, -1);
+        std::vector<char> carriesBasis(edgeCount, 0);
+        for (int a = 0; a < nr; ++a)
+            for (const auto &sp : rooftop.functions[static_cast<std::size_t>(a)].supports)
+            {
+                lastUse[static_cast<std::size_t>(sp.edgeIndex)] = a;
+                carriesBasis[static_cast<std::size_t>(sp.edgeIndex)] = 1;
+            }
+        std::vector<std::vector<RooftopPairVariants>> spanRows(edgeCount);
+        auto spanRow = [&](int observationEdge) -> const std::vector<RooftopPairVariants> &
+        {
+            auto &row = spanRows[static_cast<std::size_t>(observationEdge)];
+            if (row.empty())
+            {
+                row.resize(edgeCount);
+                const auto &obs = orientedEdges[static_cast<std::size_t>(observationEdge)];
+                for (std::size_t se = 0; se < edgeCount; ++se)
+                {
+                    if (!carriesBasis[se]) continue;
+                    const auto &src = orientedEdges[se];
+                    const double aEff = 0.5 * (std::max(obs.radiusM, 1e-12) + std::max(src.radiusM, 1e-12));
+                    row[se] = integrateRooftopPairMixedPotential(obs.p0, obs.p1, obs.tangent, src.p0, src.p1,
+                                                                 src.tangent, aEff, k, omega);
+                }
+            }
+            return row;
+        };
+
         for (int a = 0; a < nr; ++a)
         {
             const auto &test = rooftop.functions[static_cast<std::size_t>(a)];
@@ -1475,19 +1400,19 @@ WireNetworkMomResult solveWireNetworkMom(const WireNetworkMomInput &input)
                 std::complex<double> zab{0.0, 0.0};
                 for (const auto &so : test.supports)
                 {
-                    const auto &obs = orientedEdges[static_cast<std::size_t>(so.edgeIndex)];
+                    const auto &pairs = spanRow(so.edgeIndex);
                     for (const auto &ss : trial.supports)
                     {
-                        const auto &src = orientedEdges[static_cast<std::size_t>(ss.edgeIndex)];
-                        const double aEff = 0.5 * (std::max(obs.radiusM, 1e-12) + std::max(src.radiusM, 1e-12));
-                        const auto pair =
-                            integrateProjectedRooftopPair(obs.p0, obs.p1, obs.tangent, so.peakAtP0, src.p0, src.p1,
-                                                          src.tangent, ss.peakAtP0, aEff, k, omega);
+                        const auto &pair =
+                            pairs[static_cast<std::size_t>(ss.edgeIndex)][rooftopVariant(so.peakAtP0, ss.peakAtP0)];
                         zab += so.endpointCoefficient * ss.endpointCoefficient * pair;
                     }
                 }
                 A[static_cast<std::size_t>(a)][static_cast<std::size_t>(b)] = zab;
             }
+            for (const auto &sp : test.supports)
+                if (lastUse[static_cast<std::size_t>(sp.edgeIndex)] == a)
+                    std::vector<RooftopPairVariants>().swap(spanRows[static_cast<std::size_t>(sp.edgeIndex)]);
         }
 
         std::vector<std::complex<double>> solution;

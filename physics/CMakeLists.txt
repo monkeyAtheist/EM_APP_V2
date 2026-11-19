@@ -2,6 +2,7 @@
 add_library(qsig_physics STATIC
     src/antenna_surface_geometry.cpp
     src/antenna_validation_bench.cpp
+    src/dense_solver.cpp
     src/electrostatics.cpp
     src/em_calculator_model.cpp
     src/em_engineering_model.cpp
@@ -12,8 +13,10 @@ add_library(qsig_physics STATIC
     src/laplace_rail_model.cpp
     src/magnetostatics.cpp
     src/microstrip_models.cpp
+    src/moment_method.cpp
     src/numerical_em_solvers.cpp
     src/pec_surface_mom.cpp
+    src/sheet_integrals.cpp
     src/vna_time_domain.cpp
 )
 add_library(qsig::physics ALIAS qsig_physics)
@@ -21,6 +24,9 @@ add_library(qsig::physics ALIAS qsig_physics)
 target_include_directories(qsig_physics PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_compile_features(qsig_physics PUBLIC cxx_std_20)
+# The large dense solver shares its rows between threads.
+find_package(Threads REQUIRED)
+target_link_libraries(qsig_physics PUBLIC Threads::Threads)
 qsig_set_warnings(qsig_physics)
 qsig_set_fp_model(qsig_physics)
 

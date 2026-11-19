@@ -15,10 +15,11 @@ using qsig::constants::mu0;
 using qsig::constants::pi;
 
 // Complete elliptic integrals K(k), E(k) of modulus k by the arithmetic-geometric mean.
-// Portable (libc++ has no std::comp_ellint_*).
-inline std::pair<double, double> ellipticKE(double k)
+// Portable (libc++ has no std::comp_ellint_*). Pass the complementary modulus kc = sqrt(1 - k^2) when
+// it is known exactly: near k = 1, computing it from k loses most of its digits.
+inline std::pair<double, double> ellipticKE(double k, double kc = -1.0)
 {
-    double a = 1.0, b = std::sqrt(1.0 - k * k), c = k;
+    double a = 1.0, b = kc >= 0.0 ? kc : std::sqrt(1.0 - k * k), c = k;
     double sum = 0.5 * c * c, power = 0.5;
     for (int i = 0; i < 40 && std::abs(c) > 1e-16; ++i)
     {
@@ -41,8 +42,8 @@ inline std::pair<double, double> loopField(double R, double I, double rho, doubl
     if (rho < 1e-12) return {0.0, mu0 * I * R * R / (2.0 * std::pow(R * R + z * z, 1.5))};
     const double q = (R + rho) * (R + rho) + z * z;
     const double k = std::sqrt(4.0 * R * rho / q);
-    const auto [K, E] = ellipticKE(k);
     const double d = (R - rho) * (R - rho) + z * z;
+    const auto [K, E] = ellipticKE(k, std::sqrt(d / q));
     const double c = mu0 * I / (2.0 * pi * std::sqrt(q));
     const double bz = c * (K + (R * R - rho * rho - z * z) / d * E);
     const double brho = c * z / rho * (-K + (R * R + rho * rho + z * z) / d * E);
@@ -101,4 +102,10 @@ struct DipoleReference
     double reactanceBandOhm;
 };
 inline constexpr DipoleReference kHalfWaveDipole{0.5, 1e-3, 88.2, 50.0, 15.0};
+
+// Resonance (X = 0) of the same thin dipole, Hallen reduced kernel (tools/reference/hallen_reference.py,
+// bisection on the length): 0.47244 lambda at N = 121, 0.47300 at N = 161; R = 72.1 ohm at both.
+// Unlike the reactance at L = lambda/2, it hardly depends on the delta-gap feed model.
+inline constexpr double kThinDipoleResonantLengthLambda = 0.4727;
+inline constexpr double kThinDipoleResonantResistanceOhm = 72.1;
 } // namespace reference

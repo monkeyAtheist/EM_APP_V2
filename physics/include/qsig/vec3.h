@@ -44,6 +44,8 @@ struct Vec3
         z /= s;
         return *this;
     }
+    // Exact comparison: for "is this the same data" (undo, cached results), not for geometry.
+    constexpr bool operator==(const Vec3 &) const noexcept = default;
 };
 
 constexpr Vec3 operator+(const Vec3 &a, const Vec3 &b) noexcept

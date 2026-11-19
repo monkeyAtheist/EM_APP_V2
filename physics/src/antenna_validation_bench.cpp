@@ -386,7 +386,8 @@ SolverRow makeDipoleRow(double fHz, NumericalEM::WireCurrentBasisTreatment basis
     SolverRow row;
     row.caseKind = CaseKind::HalfWaveDipole;
     row.caseName = caseName(row.caseKind);
-    row.productionPath = basis == NumericalEM::WireCurrentBasisTreatment::PulsePointMatching;
+    // Production path: the Galerkin rooftop basis (default of the wire MoM since QTsignalApp_V2).
+    row.productionPath = basis == NumericalEM::WireCurrentBasisTreatment::LinearRooftopCharge;
     row.solverName = basis == NumericalEM::WireCurrentBasisTreatment::PulsePointMatching ? "Pulse / point matching"
                                                                                          : "Linear rooftop / Galerkin";
     const auto pair = solveWirePair(dipoleInput(fHz, basis, false), dipoleInput(fHz, basis, true));
@@ -401,10 +402,15 @@ SolverRow makeDipoleRow(double fHz, NumericalEM::WireCurrentBasisTreatment basis
     row.fineUnknowns = pair.fine.unknownCount;
     const auto zc = pair.current.feeds.front().activeImpedanceOhm, zf = pair.fine.feeds.front().activeImpedanceOhm;
     row.inputImpedanceOhm = zf;
-    row.referenceImpedanceOhm = {73.13, 42.5};
+    // Reference: Hallen's equation for the same thin wire (a = lambda/1000, reduced kernel, delta gap),
+    // solved by an independent tool (tools/reference/hallen_reference.py): R = 88.2 ohm converged to
+    // ~0.3 %, X = 50 ohm within a +-15 ohm band (it follows the gap model). The induced-EMF value
+    // 73.1 + j42.5 ohm assumes a sinusoidal current on a vanishing radius: it is not this antenna, and
+    // judging against it declared PASS with a 23.5 % error. Only R decides; X is reported.
+    row.referenceImpedanceOhm = {88.2, 50.0};
     row.hasReferenceImpedance = true;
     row.meshDeltaPercent = relativePercent(zc, zf);
-    row.impedanceReferenceErrorPercent = relativePercent(zf, row.referenceImpedanceOhm);
+    row.impedanceReferenceErrorPercent = scalarRelativePercent(zf.real(), row.referenceImpedanceOhm.real());
     row.directivityDbi = pair.fine.directivityDbi;
     row.referenceDirectivityDbi = 2.15;
     row.hasReferenceDirectivity = true;
@@ -413,19 +419,24 @@ SolverRow makeDipoleRow(double fHz, NumericalEM::WireCurrentBasisTreatment basis
     row.patternCalculated = pair.fine.elevationNormalizedFarField;
     row.patternReference = referencePattern(row.patternAngleDeg, row.caseKind);
     row.patternRmsPercent = normalizedPatternRms(row.patternAngleDeg, row.patternCalculated, row.patternReference);
-    row.referenceSummary = "Thin center-fed L=0.5 lambda dipole: Zin ≈ 73.1+j42.5 ohm and D ≈ 2.15 dBi; normalized "
-                           "E-plane reference cos((pi/2)cos(theta))/sin(theta).";
-    row.primaryMetricName = "|ΔZref|";
+    row.referenceSummary = "Thin centre-fed L = 0.5 lambda dipole, a = lambda/1000: Hallen reference R = 88.2 ohm "
+                           "(X = 50 +- 15 ohm, gap dependent), D = 2.15 dBi; normalized E-plane reference "
+                           "cos((pi/2)cos(theta))/sin(theta).";
+    row.primaryMetricName = "|ΔR|";
     row.primaryMetricValue = row.impedanceReferenceErrorPercent;
     row.primaryMetricReference = 0.0;
     row.primaryMetricErrorPercent = row.impedanceReferenceErrorPercent;
     row.boundaryResidualRelative = pair.fine.linearRooftopBasisUsed ? pair.fine.maxOpenEndCurrentRelative
                                                                     : pair.fine.maxJunctionCurrentDiscontinuity;
-    row.verdict =
-        verdictFrom(row.meshDeltaPercent, row.directivityErrorDb, row.impedanceReferenceErrorPercent, 35.0, 70.0);
+    // PASS: R within 3 % of the reference (what the reference itself supports), WARNING within 8 %.
+    row.verdict = verdictFrom(row.meshDeltaPercent, row.directivityErrorDb, row.impedanceReferenceErrorPercent, 3.0, 8.0,
+                              0.1, 0.3);
+    const bool reactanceInBand = std::abs(zf.imag() - row.referenceImpedanceOhm.imag()) <= 15.0;
+    if (row.verdict == Verdict::Pass && !reactanceInBand) row.verdict = Verdict::Warning;
     std::ostringstream ss;
-    ss << "mesh ΔZ=" << row.meshDeltaPercent << "%, reference ΔZ=" << row.impedanceReferenceErrorPercent
-       << "%, ΔD=" << row.directivityErrorDb << " dB, pattern RMS=" << row.patternRmsPercent << "%.";
+    ss << "mesh ΔZ=" << row.meshDeltaPercent << "%, reference ΔR=" << row.impedanceReferenceErrorPercent
+       << "%, X=" << zf.imag() << " ohm (reference band 35..65), ΔD=" << row.directivityErrorDb
+       << " dB, pattern RMS=" << row.patternRmsPercent << "%.";
     row.verdictReason = ss.str();
     return row;
 }
@@ -843,8 +854,8 @@ CaseReport runProductionCase(CaseKind kind, double frequencyHz)
     switch (kind)
     {
     case CaseKind::HalfWaveDipole:
-        report.rows.push_back(makeDipoleRow(frequencyHz, NumericalEM::WireCurrentBasisTreatment::PulsePointMatching));
-        report.note = "Frozen 1.0 production path only.";
+        report.rows.push_back(makeDipoleRow(frequencyHz, NumericalEM::WireCurrentBasisTreatment::LinearRooftopCharge));
+        report.note = "Production path only.";
         break;
     case CaseKind::SmallCircularLoop:
         report.rows.push_back(makeLoopRow(frequencyHz, NumericalEM::WireCurrentBasisTreatment::PulsePointMatching));

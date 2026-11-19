@@ -152,7 +152,10 @@ enum class WireJunctionTreatment
 };
 
 // Trial/test current model for the generalized wire solver. PulsePointMatching is
-// the historical constant-current pulse formulation. LinearRooftopCharge creates
+// the historical constant-current pulse formulation: with the dyadic kernel it under-estimates
+// the reactance (half-wave dipole, a = 1e-3 lambda: 82 + j25 ohm instead of about 87 + j47),
+// whatever the mesh; kept for comparison and for the 6.14 parity. LinearRooftopCharge (the
+// default since the V2 audit) is a Galerkin formulation that converges with the mesh. It creates
 // node-centred piecewise-linear current functions: current vanishes naturally at
 // open ends, is continuous through ordinary degree-2 nodes and spans d-1 KCL-safe
 // modes at a degree-d T/Y/X junction.
@@ -176,7 +179,7 @@ struct WireNetworkMomInput
     // solves in a current subspace that satisfies branch continuity by construction. LagrangeKcl
     // preserves the historical saddle-point formulation for comparison/validation.
     WireJunctionTreatment junctionTreatment = WireJunctionTreatment::ReducedBasis;
-    WireCurrentBasisTreatment currentBasisTreatment = WireCurrentBasisTreatment::PulsePointMatching;
+    WireCurrentBasisTreatment currentBasisTreatment = WireCurrentBasisTreatment::LinearRooftopCharge;
     bool computeFarField = true;
     double farFieldCutStepDeg = 1.0;
     double farFieldIntegrationStepDeg = 5.0;

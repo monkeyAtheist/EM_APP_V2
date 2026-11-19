@@ -50,9 +50,25 @@ TEST_CASE("parity: electrostatic kernels", "[parity]")
         CHECK((r.potentialDefined ? 1.0 : 0.0) == c.next());
         CHECK((r.singular ? 1.0 : 0.0) == c.next());
     };
+    // Plates and slab were replaced by exact kernels in phase 1 (the 6.14 point-charge grids were
+    // the defect): their baseline entries are skipped, as is the whole-scene sum that includes them.
+    using T = Electrostatics::Source::Type;
+    auto replaced = [](T t)
+    {
+        return t == T::RectangularPlate || t == T::CircularPlate || t == T::AnnularPlate || t == T::TriangularPlate ||
+               t == T::RectangularVolume;
+    };
     for (const auto &s : sources)
-        for (const auto &p : scenarios::probePoints()) compare(Electrostatics::fieldAt({s}, {p[0], p[1], p[2]}));
-    for (const auto &p : scenarios::probePoints()) compare(Electrostatics::fieldAt(sources, {p[0], p[1], p[2]}));
+        for (const auto &p : scenarios::probePoints())
+        {
+            if (replaced(s.type))
+            {
+                c.index += 6;
+                continue;
+            }
+            compare(Electrostatics::fieldAt({s}, {p[0], p[1], p[2]}));
+        }
+    c.index += 6 * scenarios::probePoints().size();
     CHECK(c.index == c.size);
 }
 
@@ -69,17 +85,38 @@ TEST_CASE("parity: magnetostatic kernels", "[parity]")
         CHECK_NEAR(r.magneticFluxDensity.z, bz, kRel, floor);
         CHECK((r.singular ? 1.0 : 0.0) == c.next());
     };
+    // Loops, solenoid and Helmholtz pair became exact in phase 2 (the 6.14 polygons of 88 to 320 segments
+    // and the 28 "virtual" loops of the solenoid were the defect): their entries are skipped, as is the
+    // whole-scene sum that includes them.
+    using T = Magnetostatics::Source::Type;
+    auto replaced = [](T t) { return t == T::CircularLoop || t == T::Solenoid || t == T::HelmholtzPair; };
     for (const auto &s : sources)
-        for (const auto &p : scenarios::probePoints()) compare(Magnetostatics::fieldAt({s}, {p[0], p[1], p[2]}));
-    for (const auto &p : scenarios::probePoints()) compare(Magnetostatics::fieldAt(sources, {p[0], p[1], p[2]}));
+        for (const auto &p : scenarios::probePoints())
+        {
+            if (replaced(s.type))
+            {
+                c.index += 4;
+                continue;
+            }
+            compare(Magnetostatics::fieldAt({s}, {p[0], p[1], p[2]}));
+        }
+    c.index += 4 * scenarios::probePoints().size();
     CHECK(c.index == c.size);
 }
 
-TEST_CASE("parity: FDTD time stepping (CPML, Mur, PEC; TMz and TEz)", "[parity]")
+TEST_CASE("parity: FDTD time stepping (Mur, PEC; TMz and TEz)", "[parity]")
 {
+    // The CPML was corrected after the audit (its magnetic profile sat on the electric nodes, half a cell
+    // off: -38 dB of reflection instead of -95 dB): the CPML cases are skipped, the CPML tests of the
+    // [fdtd] group measure the absorber against a reference box instead.
     auto c = cursor(kLegacyFdtd);
     for (const auto &fc : scenarios::fdtdCases())
     {
+        if (fc.boundary == FDTD::BoundaryCondition::Cpml)
+        {
+            c.index += 4 * scenarios::fdtdProbes().size() + 1;
+            continue;
+        }
         FDTD::Solver2D solver;
         scenarios::setupFdtd(solver, fc);
         solver.step(fc.steps);
@@ -153,14 +190,21 @@ TEST_CASE("parity: calculator expressions", "[parity]")
         CHECK_REL(EmCalculator::evaluateExpression(expression).value, c.next(), 1e-11);
 }
 
-TEST_CASE("parity: production validation bench (dipole, loop, monopole)", "[parity][slow]")
+TEST_CASE("parity: production validation bench (loop, monopole)", "[parity][slow]")
 {
     // The patch case is excluded: its production path makes a discrete choice that flips on
     // last-bit rounding (see "validation bench: patch impedance is passive").
+    // The dipole is skipped: its production path (pulse -> rooftop basis) and its reference were
+    // changed on purpose when the bench was fixed (a PASS at 23.5 % error, see test_solvers.cpp).
     auto c = cursor(kLegacyValidation);
     for (auto kind : {AntennaValidation::CaseKind::HalfWaveDipole, AntennaValidation::CaseKind::SmallCircularLoop,
                       AntennaValidation::CaseKind::QuarterWaveMonopole})
     {
+        if (kind == AntennaValidation::CaseKind::HalfWaveDipole)
+        {
+            c.index += 4;
+            continue;
+        }
         const auto report = AntennaValidation::runProductionCase(kind, 100e6);
         REQUIRE(!report.rows.empty());
         const auto &row = report.rows.front();

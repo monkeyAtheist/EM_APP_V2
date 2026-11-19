@@ -115,6 +115,8 @@ public:
     void setCpmlTargetReflection(double reflection);
 
     void clearMaterials();
+    // Whole grid at once (row-major, nx * ny): one coefficient rebuild instead of one per cell.
+    void setMaterials(const std::vector<Material> &materials);
     void setMaterialCell(int x, int y, const Material &material);
     void setMaterialRect(int x0, int y0, int x1, int y1, const Material &material);
     Material materialAt(int x, int y) const;
@@ -128,6 +130,9 @@ public:
     bool setSource(std::size_t index, const Source &source);
     bool removeSource(std::size_t index);
     void clearSources();
+    // Replaces every source. An empty list leaves the grid without any emitter (unlike clearSources(),
+    // which restores the default source for compatibility).
+    void setSources(const std::vector<Source> &sources);
 
     GuideModeSource guideModeSource() const noexcept { return m_guideModeSource; }
     void setGuideModeSource(const GuideModeSource &source);
@@ -175,6 +180,8 @@ private:
 
     void rebuildCoefficients();
     void rebuildCoefficientAt(int x, int y);
+    void rebuildMagneticCoefficientAt(int x, int y);
+    void rebuildCpmlActivity();
     void rebuildCpmlProfiles();
     void clearCpmlMemory();
     double sourceValue(const Source &source, double timeS) const noexcept;
@@ -214,7 +221,15 @@ private:
     std::vector<double> m_hz;
     std::vector<double> m_ceze;
     std::vector<double> m_cezh;
+    // Precomputed per cell (dt / mu with the averaged mu each update uses) and the PEC mask: the
+    // update loops then read a few compact arrays instead of the Material structs.
+    std::vector<double> m_dtOverMuY; // Hx (TMz): mu averaged with the cell above
+    std::vector<double> m_dtOverMuX; // Hy (TMz): mu averaged with the cell to the right
+    std::vector<double> m_dtOverMu;  // Hz (TEz)
+    std::vector<unsigned char> m_pec;
     std::vector<Material> m_materials;
+    // Rows / columns where the CPML stretching is active (elsewhere psi stays 0 and kappa is 1).
+    std::vector<unsigned char> m_cpmlRowE, m_cpmlRowH, m_cpmlColE, m_cpmlColH;
 
     // CPML axis profiles. E/H variants use matched electric/magnetic conductivities.
     std::vector<double> m_kappaXE, m_bXE, m_cXE;

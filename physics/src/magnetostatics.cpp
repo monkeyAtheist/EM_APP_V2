@@ -1,15 +1,13 @@
 #include "qsig/magnetostatics.h"
+#include "qsig/sheet_integrals.h"
+#include "qsig/special_functions.h"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace Magnetostatics
 {
-
-namespace
-{
-constexpr double SingularDistance = 1e-8;
-constexpr double Pi = qsig::constants::pi;
 
 void perpendicularBasis(const Vec3 &axis, Vec3 &u, Vec3 &v)
 {
@@ -18,6 +16,11 @@ void perpendicularBasis(const Vec3 &axis, Vec3 &u, Vec3 &v)
     u = normalized(cross(a, reference));
     v = normalized(cross(a, u));
 }
+
+namespace
+{
+constexpr double SingularDistance = 1e-8;
+constexpr double Pi = qsig::constants::pi;
 
 Vec3 finiteSegmentField(const Vec3 &p0, const Vec3 &p1, double current, const Vec3 &point, bool *singular)
 {
@@ -99,24 +102,92 @@ Vec3 lorentzForceAt(const std::vector<Source> &sources, const Vec3 &point, doubl
     return cross(velocity, field.magneticFluxDensity) * testChargeC;
 }
 
-static Vec3 loopField(const Vec3 &center, const Vec3 &axis, double radius, double effectiveCurrent, const Vec3 &point,
-                      int segments, bool *singular)
+namespace
 {
-    Vec3 u, v;
-    perpendicularBasis(axis, u, v);
-    Vec3 result;
-    const int n = std::max(24, segments);
+// Point in the frame of a source with axis n centred at 'center': z along the axis, rho away from it.
+struct AxialFrame
+{
+    double z = 0.0;
+    double rho = 0.0;
+    Vec3 axis;
+    Vec3 radialUnit; // zero on the axis
+};
 
-    for (int i = 0; i < n; ++i)
-    {
-        const double a0 = 2.0 * Pi * double(i) / double(n);
-        const double a1 = 2.0 * Pi * double(i + 1) / double(n);
-        const Vec3 p0 = center + (u * std::cos(a0) + v * std::sin(a0)) * radius;
-        const Vec3 p1 = center + (u * std::cos(a1) + v * std::sin(a1)) * radius;
-        result += finiteSegmentField(p0, p1, effectiveCurrent, point, singular);
-    }
-    return result;
+AxialFrame axialFrame(const Vec3 &center, const Vec3 &axis, const Vec3 &point)
+{
+    AxialFrame f;
+    f.axis = normalized(axis);
+    const Vec3 r = point - center;
+    f.z = dot(r, f.axis);
+    const Vec3 radial = r - f.axis * f.z;
+    f.rho = radial.norm();
+    f.radialUnit = f.rho > 0.0 ? radial / f.rho : Vec3{};
+    return f;
 }
+
+// Exact field of a circular filament (complete elliptic integrals K and E); the current turns
+// counterclockwise about 'axis'. Replaces the 6.14 polygon of 320 straight segments.
+Vec3 exactLoopField(const Vec3 &center, const Vec3 &axis, double a, double current, const Vec3 &point, bool *singular)
+{
+    const AxialFrame f = axialFrame(center, axis, point);
+    const double rho = f.rho, z = f.z;
+    const double mu0I = qsig::constants::mu0 * current;
+    const double q = (a + rho) * (a + rho) + z * z;
+    const double d = (a - rho) * (a - rho) + z * z; // squared distance to the wire in the meridian plane
+    if (d <= SingularDistance * SingularDistance)
+    {
+        if (singular) *singular = true;
+        return {};
+    }
+    const double k2 = 4.0 * a * rho / q;
+    if (k2 < 1e-8)
+    {
+        // Near the axis: on-axis field plus the first-order radial term (from div B = 0).
+        const double s = a * a + z * z;
+        const double bz = mu0I * a * a / (2.0 * s * std::sqrt(s));
+        const double brho = 3.0 * mu0I * a * a * z * rho / (4.0 * s * s * std::sqrt(s));
+        return f.axis * bz + f.radialUnit * brho;
+    }
+    double K = 0.0, E = 0.0;
+    qsig::sheet::ellipticKEc(std::sqrt(k2), std::sqrt(d / q), K, E); // exact complementary modulus near the wire
+    const double c = mu0I / (2.0 * Pi * std::sqrt(q));
+    const double bz = c * (K + (a * a - rho * rho - z * z) / d * E);
+    const double brho = c * z / rho * (-K + (a * a + rho * rho + z * z) / d * E);
+    return f.axis * bz + f.radialUnit * brho;
+}
+
+// Exact field of a finite solenoid modelled as a uniform cylindrical current sheet (n = N / L turns per
+// metre), after Derby and Olbert, Am. J. Phys. 78, 229 (2010). Singular only on the end rings.
+Vec3 solenoidSheetField(const Vec3 &center, const Vec3 &axis, double a, double length, double turnsPerMetre,
+                        double current, const Vec3 &point, bool *singular)
+{
+    const AxialFrame f = axialFrame(center, axis, point);
+    const double rho = f.rho;
+    const double b0 = qsig::constants::mu0 * turnsPerMetre * current / Pi;
+    const double gamma = (a - rho) / (a + rho);
+    double brho = 0.0, bz = 0.0;
+    for (const double side : {1.0, -1.0})
+    {
+        const double zs = f.z + side * 0.5 * length; // z+ then z-
+        const double far = std::sqrt(zs * zs + (rho + a) * (rho + a));
+        const double kc = std::sqrt(zs * zs + (a - rho) * (a - rho)) / far;
+        if (kc < 1e-12)
+        {
+            if (singular) *singular = true;
+            return {};
+        }
+        const double alpha = a / far;
+        const double beta = zs / far;
+        brho += side * alpha * qsig::special::bulirschCel(kc, 1.0, 1.0, -1.0);
+        bz += side * beta * qsig::special::bulirschCel(kc, gamma * gamma, 1.0, gamma);
+    }
+    return f.axis * (b0 * a / (a + rho) * bz) + f.radialUnit * (b0 * brho);
+}
+} // namespace
+
+// Up to this many turns the solenoid is drawn and computed turn by turn (exact loops); above, as the
+// ideal current sheet, which differs from the real winding only within about one pitch of the wire.
+constexpr int kDiscreteSolenoidTurns = 24;
 
 FieldResult fieldFromSource(const Source &source, const Vec3 &point)
 {
@@ -155,8 +226,9 @@ FieldResult fieldFromSource(const Source &source, const Vec3 &point)
     }
     else if (source.type == Type::CircularLoop)
     {
-        out.magneticFluxDensity = loopField(source.position, axisUnit(source), std::max(source.radius, 1e-9),
-                                            source.strength, point, 320, &out.singular);
+        out.magneticFluxDensity = exactLoopField(source.position, axisUnit(source), std::max(source.radius, 1e-9),
+                                                 source.strength, point, &out.singular);
+        if (out.singular) out.note = std::string("Measurement point lies on the current loop.");
     }
     else if (source.type == Type::RectangularLoop || source.type == Type::TriangularLoop)
     {
@@ -190,26 +262,34 @@ FieldResult fieldFromSource(const Source &source, const Vec3 &point)
     else if (source.type == Type::Solenoid)
     {
         const Vec3 axis = axisUnit(source);
-        const int virtualLoops = std::clamp(source.turns, 1, 28);
-        const double effectiveCurrent = source.strength * double(std::max(source.turns, 1)) / double(virtualLoops);
+        const int turns = std::max(source.turns, 1);
         const double length = std::max(source.length, 1e-9);
-        for (int i = 0; i < virtualLoops; ++i)
+        const double radius = std::max(source.radius, 1e-9);
+        if (turns <= kDiscreteSolenoidTurns)
         {
-            const double s =
-                virtualLoops == 1 ? 0.0 : -0.5 * length + (double(i) + 0.5) * length / double(virtualLoops);
-            const Vec3 center = source.position + axis * s;
-            out.magneticFluxDensity +=
-                loopField(center, axis, std::max(source.radius, 1e-9), effectiveCurrent, point, 88, &out.singular);
+            for (int i = 0; i < turns; ++i)
+            {
+                const double s = turns == 1 ? 0.0 : -0.5 * length + (double(i) + 0.5) * length / double(turns);
+                out.magneticFluxDensity +=
+                    exactLoopField(source.position + axis * s, axis, radius, source.strength, point, &out.singular);
+            }
         }
+        else
+        {
+            out.magneticFluxDensity = solenoidSheetField(source.position, axis, radius, length, double(turns) / length,
+                                                         source.strength, point, &out.singular);
+        }
+        if (out.singular) out.note = std::string("Measurement point lies on the solenoid winding.");
     }
     else if (source.type == Type::HelmholtzPair)
     {
         const Vec3 axis = axisUnit(source);
         const double separation = source.length > SingularDistance ? source.length : std::max(source.radius, 1e-9);
-        out.magneticFluxDensity += loopField(source.position - axis * (0.5 * separation), axis,
-                                             std::max(source.radius, 1e-9), source.strength, point, 220, &out.singular);
-        out.magneticFluxDensity += loopField(source.position + axis * (0.5 * separation), axis,
-                                             std::max(source.radius, 1e-9), source.strength, point, 220, &out.singular);
+        out.magneticFluxDensity += exactLoopField(source.position - axis * (0.5 * separation), axis,
+                                                  std::max(source.radius, 1e-9), source.strength, point, &out.singular);
+        out.magneticFluxDensity += exactLoopField(source.position + axis * (0.5 * separation), axis,
+                                                  std::max(source.radius, 1e-9), source.strength, point, &out.singular);
+        if (out.singular) out.note = std::string("Measurement point lies on a Helmholtz coil.");
     }
     else if (source.type == Type::InfiniteCurrentSheet)
     {
@@ -281,6 +361,24 @@ std::string strengthSymbol(Source::Type type)
     if (type == Source::Type::MagneticDipole) return std::string("m");
     if (type == Source::Type::InfiniteCurrentSheet) return std::string("K");
     return std::string("I");
+}
+
+double magnetomotiveForce(const std::vector<Source> &sources, const Vec3 &a, const Vec3 &b, int panels)
+{
+    constexpr double gx[4] = {-0.8611363115940526, -0.3399810435848563, 0.3399810435848563, 0.8611363115940526};
+    constexpr double gw[4] = {0.3478548451374538, 0.6521451548625461, 0.6521451548625461, 0.3478548451374538};
+    const Vec3 d = b - a;
+    const int n = std::max(1, panels);
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i)
+        for (int g = 0; g < 4; ++g)
+        {
+            const double t = (i + 0.5 * (gx[g] + 1.0)) / n;
+            const FieldResult f = fieldAt(sources, a + d * t);
+            if (f.singular) return std::numeric_limits<double>::quiet_NaN();
+            sum += gw[g] * dot(f.magneticField, d);
+        }
+    return 0.5 * sum / n;
 }
 
 std::string strengthUnit(Source::Type type)

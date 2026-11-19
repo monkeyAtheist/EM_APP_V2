@@ -1,6 +1,8 @@
 #include "qsig/electrostatics.h"
+#include "qsig/sheet_integrals.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 namespace Electrostatics
@@ -73,6 +75,11 @@ void accumulate(FieldResult &dst, const FieldResult &src)
         dst.potential += src.potential;
     else
         dst.potentialDefined = false;
+    if (dst.relativePotentialDefined && src.relativePotentialDefined)
+        dst.relativePotential += src.relativePotential;
+    else
+        dst.relativePotentialDefined = false;
+    dst.potentialReferenced = dst.potentialReferenced || src.potentialReferenced;
     dst.singular = dst.singular || src.singular;
     if (!src.note.empty())
     {
@@ -81,152 +88,81 @@ void accumulate(FieldResult &dst, const FieldResult &src)
     }
 }
 
-FieldResult integrateRectangularPlate(const Source &source, const Vec3 &point)
+// Exact uniformly charged plates and slab (qsig/sheet_integrals.h). The point is moved to the
+// source frame (centre at the origin, rotated by -angleDeg about z); the field is rotated back.
+FieldResult fromSheetIntegrals(const qsig::sheet::Integrals &g, double density, double angleRad)
 {
     FieldResult result;
-    const double width = std::max(source.width, SingularDistance);
-    const double height = std::max(source.height, SingularDistance);
-    const double aspect = width / height;
-    const int nx = std::clamp(int(std::round(24.0 * std::sqrt(aspect))), 12, 56);
-    const int ny = std::clamp(int(std::round(24.0 / std::sqrt(aspect))), 12, 56);
-    const int count = nx * ny;
-    const double dq = source.strength / double(count);
-    const double angle = qsig::constants::degToRad(source.angleDeg);
-
-    for (int ix = 0; ix < nx; ++ix)
+    const double k = qsig::constants::coulombK * density;
+    const Vec3 local = g.field * k;
+    const Vec3 xy = rotateXY(local.x, local.y, angleRad);
+    result.electricField = {xy.x, xy.y, local.z};
+    result.potential = k * g.potential;
+    if (g.onEdge)
     {
-        const double x = (-0.5 + (double(ix) + 0.5) / double(nx)) * width;
-        for (int iy = 0; iy < ny; ++iy)
-        {
-            const double y = (-0.5 + (double(iy) + 0.5) / double(ny)) * height;
-            const Vec3 offset = rotateXY(x, y, angle);
-            const Vec3 elementPos{source.position.x + offset.x, source.position.y + offset.y, source.position.z};
-            accumulate(result, pointContribution(dq, elementPos, point));
-        }
+        result.singular = true;
+        result.potentialDefined = std::isfinite(result.potential);
+        result.note = "Measurement point lies on the edge of a charged sheet (logarithmic singularity).";
     }
-    if (result.singular)
-        result.note = std::string("Measurement point lies on the numerical rectangular-plate mesh; move it slightly "
-                                  "away from the source plane.");
+    else if (g.onSheet)
+    {
+        result.note = "Measurement point lies on the charged sheet: the normal field jumps by sigma/eps0 and is not "
+                      "reported; in-plane components and potential are exact.";
+    }
     return result;
 }
 
-FieldResult integrateRectangularVolume(const Source &source, const Vec3 &point)
+Vec3 toSourceFrame(const Source &source, const Vec3 &point, double angleRad)
 {
-    FieldResult result;
+    const Vec3 d = point - source.position;
+    const Vec3 xy = rotateXY(d.x, d.y, -angleRad);
+    return {xy.x, xy.y, d.z};
+}
+
+std::vector<qsig::sheet::Point2> rectangle(double width, double height)
+{
+    const double a = 0.5 * width, b = 0.5 * height;
+    return {{-a, -b}, {a, -b}, {a, b}, {-a, b}};
+}
+
+FieldResult rectangularPlate(const Source &source, const Vec3 &point)
+{
+    const double width = std::max(source.width, SingularDistance);
+    const double height = std::max(source.height, SingularDistance);
+    const double angle = qsig::constants::degToRad(source.angleDeg);
+    const auto g = qsig::sheet::convexPolygon(rectangle(width, height), toSourceFrame(source, point, angle));
+    return fromSheetIntegrals(g, source.strength / (width * height), angle);
+}
+
+FieldResult triangularPlate(const Source &source, const Vec3 &point)
+{
+    // Isosceles triangle centred on its centroid: base at y = -h/3, apex at y = 2h/3.
+    const double width = std::max(source.width, SingularDistance);
+    const double height = std::max(source.height, SingularDistance);
+    const double angle = qsig::constants::degToRad(source.angleDeg);
+    const std::vector<qsig::sheet::Point2> triangle{
+        {-0.5 * width, -height / 3.0}, {0.5 * width, -height / 3.0}, {0.0, 2.0 * height / 3.0}};
+    const auto g = qsig::sheet::convexPolygon(triangle, toSourceFrame(source, point, angle));
+    return fromSheetIntegrals(g, source.strength / (0.5 * width * height), angle);
+}
+
+FieldResult circularPlate(const Source &source, const Vec3 &point, bool annular)
+{
+    const double outer = std::max(source.radius, SingularDistance);
+    const double inner = annular ? std::clamp(source.innerRadius, 0.0, outer * (1.0 - 1e-9)) : 0.0;
+    const double area = Pi * (outer * outer - inner * inner);
+    const auto g = qsig::sheet::annulus(inner, outer, point - source.position);
+    return fromSheetIntegrals(g, source.strength / area, 0.0);
+}
+
+FieldResult rectangularVolume(const Source &source, const Vec3 &point)
+{
     const double width = std::max(source.width, SingularDistance);
     const double height = std::max(source.height, SingularDistance);
     const double thickness = std::max(source.thickness, SingularDistance);
     const double angle = qsig::constants::degToRad(source.angleDeg);
-
-    // Tensor-product 6-point Gauss-Legendre integration over a uniformly charged
-    // rectangular parallelepiped. Because rho=Q/(W H t), mapping [-1,1]^3 onto
-    // the physical volume gives dq = Q * wx*wy*wz / 8.
-    // Even-order nodes avoid placing a quadrature point at the geometric centre.
-    static constexpr double node[6] = {-0.9324695142031521, -0.6612093864662645, -0.2386191860831969,
-                                       0.2386191860831969,  0.6612093864662645,  0.9324695142031521};
-    static constexpr double weight[6] = {0.1713244923791704, 0.3607615730481386, 0.4679139345726910,
-                                         0.4679139345726910, 0.3607615730481386, 0.1713244923791704};
-
-    for (int ix = 0; ix < 6; ++ix)
-    {
-        const double x = 0.5 * width * node[ix];
-        for (int iy = 0; iy < 6; ++iy)
-        {
-            const double y = 0.5 * height * node[iy];
-            const Vec3 xy = rotateXY(x, y, angle);
-            for (int iz = 0; iz < 6; ++iz)
-            {
-                const double z = 0.5 * thickness * node[iz];
-                const double dq = source.strength * weight[ix] * weight[iy] * weight[iz] / 8.0;
-                const Vec3 elementPos{source.position.x + xy.x, source.position.y + xy.y, source.position.z + z};
-                accumulate(result, pointContribution(dq, elementPos, point));
-            }
-        }
-    }
-    if (result.singular)
-        result.note = std::string("Measurement point coincides with a rectangular-volume quadrature node; move it "
-                                  "slightly or change the dimensions.");
-    else
-        result.note =
-            std::string("Finite-thickness rectangular slab evaluated by 6x6x6 Gauss-Legendre volume integration.");
-    return result;
-}
-
-FieldResult integrateCircularPlate(const Source &source, const Vec3 &point, bool annular)
-{
-    FieldResult result;
-    const double outer = std::max(source.radius, SingularDistance);
-    const double inner = annular ? std::clamp(source.innerRadius, 0.0, outer * (1.0 - 1e-9)) : 0.0;
-    const double area = Pi * (outer * outer - inner * inner);
-    if (area <= 0.0) return result;
-
-    // Equal-area radial bins: q is identical in every polar cell, which avoids
-    // overweighting the centre and is stable for educational off-axis studies.
-    const int nr = 26;
-    const int nphi = 72;
-    const double dq = source.strength / double(nr * nphi);
-    const double angle = qsig::constants::degToRad(source.angleDeg);
-    const double in2 = inner * inner;
-    const double out2 = outer * outer;
-    for (int ir = 0; ir < nr; ++ir)
-    {
-        const double f = (double(ir) + 0.5) / double(nr);
-        const double r = std::sqrt(in2 + f * (out2 - in2));
-        for (int ip = 0; ip < nphi; ++ip)
-        {
-            const double phi = 2.0 * Pi * (double(ip) + 0.5) / double(nphi);
-            const Vec3 offset = rotateXY(r * std::cos(phi), r * std::sin(phi), angle);
-            const Vec3 elementPos{source.position.x + offset.x, source.position.y + offset.y, source.position.z};
-            accumulate(result, pointContribution(dq, elementPos, point));
-        }
-    }
-    if (result.singular)
-        result.note = std::string("Measurement point lies on the numerical circular-plate mesh; move it slightly away "
-                                  "from the source plane.");
-    return result;
-}
-
-FieldResult integrateTriangularPlate(const Source &source, const Vec3 &point)
-{
-    FieldResult result;
-    const double width = std::max(source.width, SingularDistance);
-    const double height = std::max(source.height, SingularDistance);
-    const double angle = qsig::constants::degToRad(source.angleDeg);
-    const int nx = 64;
-    const int ny = 56;
-
-    struct Sample
-    {
-        double x;
-        double y;
-    };
-    std::vector<Sample> samples;
-    samples.reserve(nx * ny / 2);
-    // Isosceles triangle centred at its centroid: base y=-h/3, apex y=+2h/3.
-    const double yBase = -height / 3.0;
-    for (int iy = 0; iy < ny; ++iy)
-    {
-        const double y = yBase + (double(iy) + 0.5) * height / double(ny);
-        const double t = std::clamp((y - yBase) / height, 0.0, 1.0);
-        const double halfWidth = 0.5 * width * (1.0 - t);
-        for (int ix = 0; ix < nx; ++ix)
-        {
-            const double x = (-0.5 + (double(ix) + 0.5) / double(nx)) * width;
-            if (std::abs(x) <= halfWidth) samples.push_back({x, y});
-        }
-    }
-    if (samples.empty()) return result;
-    const double dq = source.strength / double(samples.size());
-    for (const auto &sample : samples)
-    {
-        const Vec3 offset = rotateXY(sample.x, sample.y, angle);
-        const Vec3 elementPos{source.position.x + offset.x, source.position.y + offset.y, source.position.z};
-        accumulate(result, pointContribution(dq, elementPos, point));
-    }
-    if (result.singular)
-        result.note = std::string("Measurement point lies on the numerical triangular-plate mesh; move it slightly "
-                                  "away from the source plane.");
-    return result;
+    const auto g = qsig::sheet::polygonSlab(rectangle(width, height), thickness, toSourceFrame(source, point, angle));
+    return fromSheetIntegrals(g, source.strength / (width * height * thickness), angle);
 }
 } // namespace
 
@@ -297,7 +233,9 @@ std::string strengthUnit(Source::Type type)
     return std::string("C");
 }
 
-FieldResult fieldFromSource(const Source &source, const Vec3 &point)
+namespace
+{
+FieldResult absoluteField(const Source &source, const Vec3 &point)
 {
     using Type = Source::Type;
 
@@ -448,12 +386,74 @@ FieldResult fieldFromSource(const Source &source, const Vec3 &point)
         return result;
     }
 
-    if (source.type == Type::RectangularPlate) return integrateRectangularPlate(source, point);
-    if (source.type == Type::RectangularVolume) return integrateRectangularVolume(source, point);
-    if (source.type == Type::CircularPlate) return integrateCircularPlate(source, point, false);
-    if (source.type == Type::AnnularPlate) return integrateCircularPlate(source, point, true);
-    if (source.type == Type::TriangularPlate) return integrateTriangularPlate(source, point);
+    if (source.type == Type::RectangularPlate) return rectangularPlate(source, point);
+    if (source.type == Type::RectangularVolume) return rectangularVolume(source, point);
+    if (source.type == Type::CircularPlate) return circularPlate(source, point, false);
+    if (source.type == Type::AnnularPlate) return circularPlate(source, point, true);
+    if (source.type == Type::TriangularPlate) return triangularPlate(source, point);
 
     return {};
+}
+
+// Potential of an infinite solid cylinder (or line when radius == 0), V = 0 at the reference radius.
+double cylinderRelativePotential(double lambda, double radius, double rho)
+{
+    const double k2 = lambda / (2.0 * Pi * qsig::constants::epsilon0);
+    if (rho >= radius) return -k2 * std::log(rho / kInfiniteReferenceRadius);
+    return -k2 * std::log(radius / kInfiniteReferenceRadius) + 0.5 * k2 * (1.0 - (rho * rho) / (radius * radius));
+}
+} // namespace
+
+bool extendsToInfinity(Source::Type type)
+{
+    using Type = Source::Type;
+    return type == Type::InfiniteLine || type == Type::InfiniteCylinderZ || type == Type::InfiniteHollowCylinderZ ||
+           type == Type::InfinitePlane;
+}
+
+FieldResult fieldFromSource(const Source &source, const Vec3 &point)
+{
+    using Type = Source::Type;
+    FieldResult result = absoluteField(source, point);
+    result.relativePotential = result.potential;
+    result.relativePotentialDefined = result.potentialDefined;
+    if (!extendsToInfinity(source.type)) return result;
+
+    result.potentialReferenced = true;
+    result.relativePotentialDefined = !result.singular;
+    if (result.singular) return result;
+    const double dx = point.x - source.position.x;
+    const double dy = point.y - source.position.y;
+    const double rho = std::hypot(dx, dy);
+    switch (source.type)
+    {
+    case Type::InfiniteLine: result.relativePotential = cylinderRelativePotential(source.strength, 0.0, rho); break;
+    case Type::InfiniteCylinderZ:
+        result.relativePotential =
+            cylinderRelativePotential(source.strength, std::max(source.radius, SingularDistance), rho);
+        break;
+    case Type::InfiniteHollowCylinderZ:
+    {
+        // Same superposition as the field: outer solid cylinder minus the inner core.
+        const double outer = std::max(source.radius, SingularDistance);
+        const double inner = std::clamp(source.innerRadius, 0.0, outer * (1.0 - 1e-9));
+        if (inner <= SingularDistance)
+        {
+            result.relativePotential = cylinderRelativePotential(source.strength, outer, rho);
+            break;
+        }
+        const double areaFactor = outer * outer - inner * inner;
+        result.relativePotential =
+            cylinderRelativePotential(source.strength * outer * outer / areaFactor, outer, rho) -
+            cylinderRelativePotential(source.strength * inner * inner / areaFactor, inner, rho);
+        break;
+    }
+    case Type::InfinitePlane:
+        result.relativePotential =
+            -source.strength * std::abs(point.z - source.position.z) / (2.0 * qsig::constants::epsilon0);
+        break;
+    default: break;
+    }
+    return result;
 }
 } // namespace Electrostatics

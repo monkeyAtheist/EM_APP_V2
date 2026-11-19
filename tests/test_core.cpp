@@ -1,15 +1,17 @@
-// Constants, vector type and dense linear solver.
+// Constants, vector type, fast sine/cosine and dense linear solver.
 
 #include "qsig_test.h"
 
 #include "qsig/constants.h"
 #include "qsig/em_calculator_model.h"
 #include "qsig/em_engineering_model.h"
+#include "qsig/fast_math.h"
 #include "qsig/fdtd_solver.h"
 #include "qsig/linalg.h"
 #include "qsig/numerical_em_solvers.h"
 #include "qsig/vec3.h"
 
+#include <algorithm>
 #include <chrono>
 #include <complex>
 #include <cstdio>
@@ -67,6 +69,44 @@ double residual(const std::vector<std::vector<T>> &a, const std::vector<T> &x, c
 }
 } // namespace
 
+TEST_CASE("sinCos: within 5e-16 of the library up to 1e5 rad, the library beyond", "[core]")
+{
+    std::mt19937_64 random(7);
+    double worst = 0.0;
+    for (double range : {1.0, 50.0, 1e4, 0.999e5})
+    {
+        std::uniform_real_distribution<double> uniform(-range, range);
+        for (int i = 0; i < 200000; ++i)
+        {
+            const double x = uniform(random);
+            double s = 0.0, c = 0.0;
+            qsig::sinCos(x, s, c);
+            worst = std::max({worst, std::abs(s - std::sin(x)), std::abs(c - std::cos(x))});
+        }
+    }
+    CHECK(worst < 5e-16);
+    // Quadrant boundaries and exact points.
+    for (double x : {0.0, 1e-300, -1e-300})
+    {
+        double s = 1.0, c = 0.0;
+        qsig::sinCos(x, s, c);
+        CHECK(s == x);
+        CHECK(c == 1.0);
+    }
+    for (int q = -8; q <= 8; ++q)
+    {
+        const double x = q * 0.25 * k::pi;
+        double s = 0.0, c = 0.0;
+        qsig::sinCos(x, s, c);
+        CHECK(std::abs(s - std::sin(x)) < 5e-16);
+        CHECK(std::abs(c - std::cos(x)) < 5e-16);
+    }
+    double s = 0.0, c = 0.0;
+    qsig::sinCos(3e7, s, c);
+    CHECK(s == std::sin(3e7));
+    CHECK(c == std::cos(3e7));
+}
+
 TEST_CASE("linalg: complex system with pivoting", "[linalg]")
 {
     using C = std::complex<double>;
@@ -87,6 +127,48 @@ TEST_CASE("linalg: complex system with pivoting", "[linalg]")
     CHECK(residual(a, x, b) < 1e-12);
     CHECK(stats.minPivot > 0.0);
     CHECK(stats.maxPivot >= stats.minPivot);
+}
+
+TEST_CASE("linalg: the blocked complex solver gives the solution of the plain one", "[linalg]")
+{
+    using C = std::complex<double>;
+    std::mt19937 rng(11);
+    std::uniform_real_distribution<double> u(-1.0, 1.0);
+    // 450 unknowns: more than one block, and enough rows for the trailing update to be shared between threads.
+    for (const std::size_t n : {std::size_t{1}, std::size_t{37}, std::size_t{450}})
+    {
+        qsig::linalg::DenseMatrix<C> plain(n, n), blocked(n, n);
+        std::vector<std::vector<C>> rows(n, std::vector<C>(n));
+        std::vector<C> b(n);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            for (std::size_t j = 0; j < n; ++j) rows[i][j] = {u(rng), u(rng)};
+            if (n > 1) rows[i][i] = 0.0; // forces row exchanges
+            b[i] = {u(rng), u(rng)};
+            for (std::size_t j = 0; j < n; ++j) plain(i, j) = blocked(i, j) = rows[i][j];
+        }
+        std::vector<C> b1 = b, b2 = b, x1, x2;
+        qsig::linalg::PivotStats s1, s2;
+        REQUIRE(qsig::linalg::solveInPlace(plain, b1, x1, s1));
+        REQUIRE(qsig::linalg::solveComplexBlocked(blocked, b2, x2, s2));
+        CHECK(residual(rows, x2, b) < 1e-11);
+        double difference = 0.0, scale = 0.0;
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            difference = std::max(difference, std::abs(x1[i] - x2[i]));
+            scale = std::max(scale, std::abs(x1[i]));
+        }
+        CHECK(difference < 1e-9 * scale);
+        CHECK_REL(s2.maxPivot, s1.maxPivot, 1e-9);
+    }
+    // A singular system is refused.
+    qsig::linalg::DenseMatrix<C> singular(3, 3);
+    const double values[3][3] = {{1.0, 2.0, 3.0}, {2.0, 4.0, 6.0}, {0.0, 1.0, 1.0}};
+    for (std::size_t i = 0; i < 3; ++i)
+        for (std::size_t j = 0; j < 3; ++j) singular(i, j) = values[i][j];
+    std::vector<C> b{1.0, 2.0, 3.0}, x;
+    qsig::linalg::PivotStats stats;
+    CHECK(!qsig::linalg::solveComplexBlocked(singular, b, x, stats));
 }
 
 TEST_CASE("linalg: singular matrix is rejected", "[linalg]")
